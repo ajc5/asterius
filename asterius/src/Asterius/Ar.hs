@@ -13,15 +13,22 @@
 -- the first entry is always the extended filename table, named @"//"@, and the
 -- following entries are the object files.
 --
+-- The special '//' entry contains the extended names. Those are referred to as
+-- /<num>, where num is the offset into the '//' entry.  In addition, filenames
+-- are terminated with '/' in the archive. @putGNUArch@ always places the
+-- filename table first.
+--
 -- Historical Note: This implementation is adapted from GHC's Ar.hs. Initially,
 -- ahc-cabal used GNU ar internally, but that was non portable (see issues #649
 -- and #345). Hence, we implemented @ahc-ar@ to better control how archive
 -- files are created, and committed to GNU-style archives. Since we have
 -- further plans of customizing the treatment of archive files, we chose to
--- roll out our own implementation of @loadArchive@/@createArchive@ (based on
--- that of GHC).
+-- roll out our own implementation of loading and creating archives, based on
+-- that of GHC.
 module Asterius.Ar
-  ( loadArchive,
+  ( loadArchiveRep,
+    loadArchiveFile,
+    loadCompleteArchiveFile,
     createArchive,
   )
 where
@@ -34,7 +41,7 @@ import Data.Binary.Put
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as CBS
 import qualified Data.ByteString.Lazy as LBS
-import Data.Foldable
+import qualified Data.Set as Set
 import Data.Traversable
 import GHC.IO.Unsafe
 import qualified IfaceEnv as GHC
@@ -128,7 +135,7 @@ putGNUArch (Archive as) = do
 -- | Create a library archive from a bunch of object files. Though the name of
 -- each object file is preserved, we set the timestamp, owner ID, group ID, and
 -- file mode to default values (0, 0, 0, and 0644, respectively). When we
--- deserialize (see 'loadArchive'), the metadata is ignored anyway.
+-- deserialize (see 'loadArchiveRep'), the metadata is ignored anyway.
 createArchive :: FilePath -> [FilePath] -> IO ()
 createArchive arFile objFiles = do
   blobs <- for objFiles (unsafeDupableInterleaveIO . BS.readFile)
@@ -151,20 +158,45 @@ writeGNUAr fp = LBS.writeFile fp . runPut . putGNUArch
 
 -------------------------------------------------------------------------------
 
+loadArchive :: FilePath -> IO Archive
+loadArchive path = parseAr <$> BS.readFile path
+
 -- | Load the contents of an archive (@.a@) file. 'loadArchive' ignores (@.o@)
 -- files in the archive that cannot be parsed. Also, the metadata of the
 -- contained files are ignored ('createArchive' always sets them to default
 -- values anyway).
-loadArchive :: GHC.NameCacheUpdater -> FilePath -> IO AsteriusCachedModule
-loadArchive ncu p = do
-  Archive entries <- parseAr <$> BS.readFile p
-  foldlM
-    ( \acc ArchiveEntry {..} -> tryGetBS ncu filedata >>= \case
-        Left _ -> pure acc
-        Right m -> pure $ m <> acc
-    )
-    mempty
-    entries
+loadArchiveRep :: GHC.NameCacheUpdater -> FilePath -> IO AsteriusRepModule
+loadArchiveRep ncu path = do
+  Archive entries <- loadArchive path
+  ms <- for entries $ \ArchiveEntry {..} -> tryGetBS ncu filedata >>= \case
+    Left {} -> pure mempty -- Note [Malformed object files] in Asterius.Ld
+    Right m -> pure
+                 AsteriusRepModule
+                   { dependencyMap = onDiskDependencyMap m,
+                     moduleExports = onDiskModuleExports m,
+                     objectSources = mempty, -- Set it once and for all afterwards
+                     archiveSources = mempty,
+                     inMemoryModule = mempty
+                   }
+  let combined = mconcat ms
+  pure combined {archiveSources = Set.singleton path}
+
+loadArchiveFile :: GHC.NameCacheUpdater -> FilePath -> (AsteriusModule -> AsteriusModule) -> IO AsteriusModule
+loadArchiveFile ncu path fn = do
+  Archive entries <- loadArchive path
+  ms <- for entries $ \ArchiveEntry {..} -> tryGetBS ncu filedata >>= \case
+    Left {} -> pure mempty -- Note [Malformed object files] in Asterius.Ld
+    Right m -> pure $ fn $ onDiskToInMemory m
+  pure $ mconcat ms
+
+-- could also be loadArchiveFile ncu path id, but let's see if this is more efficient.
+loadCompleteArchiveFile :: GHC.NameCacheUpdater -> FilePath -> IO AsteriusModule
+loadCompleteArchiveFile ncu path = do
+  Archive entries <- loadArchive path
+  ms <- for entries $ \ArchiveEntry {..} -> tryGetBS ncu filedata >>= \case
+    Left {} -> pure mempty -- Note [Malformed object files] in Asterius.Ld
+    Right m -> pure $ onDiskToInMemory m
+  pure $ mconcat ms
 
 getAllArEntryFields :: Get (CBS.ByteString, Int, Int, Int, Int, Int, CBS.ByteString)
 getAllArEntryFields = do
@@ -200,11 +232,6 @@ getMany fn = do
     then return []
     else (:) <$> fn <*> getMany fn
 
--- | GNU Archives feature a special '//' entry that contains the
--- extended names. Those are referred to as /<num>, where num is the
--- offset into the '//' entry.
--- In addition, filenames are terminated with '/' in the archive.
--- @putGNUArch@ always places the filename table first.
 getGNUArchEntries :: Get [ArchiveEntry]
 getGNUArchEntries = do
   filenamesTable <- getExtendedFileNamesTable
